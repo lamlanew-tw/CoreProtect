@@ -13,7 +13,7 @@ jobs:
       - name: Set up Java JDK
         uses: actions/setup-java@v4
         with:
-          java-version: '17' # Or '21' depending on the latest MC target requirements
+          java-version: '21' # Or '21' depending on the latest MC target requirements
           distribution: 'temurin'
 
       - name: Build with Maven

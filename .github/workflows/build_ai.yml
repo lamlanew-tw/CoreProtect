@@ -1,0 +1,26 @@
+name: Build CoreProtect Jar
+
+on:
+  workflow_dispatch: # Allows you to manually trigger the build with a button
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17' # Or '21' depending on the latest MC target requirements
+          distribution: 'temurin'
+
+      - name: Build with Maven
+        run: mvn clean package
+
+      - name: Upload Compiled Jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoreProtect-Build
+          path: target/*.jar

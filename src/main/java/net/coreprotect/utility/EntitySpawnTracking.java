@@ -2,6 +2,7 @@ package net.coreprotect.utility;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -16,6 +17,8 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
+import org.bukkit.DyeColor;
 import org.bukkit.Location;
 import org.bukkit.NamespacedKey;
 import org.bukkit.TreeSpecies;
@@ -31,14 +34,17 @@ import org.bukkit.inventory.EntityEquipment;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.material.Colorable;
 import org.bukkit.persistence.PersistentDataType;
 
 import net.coreprotect.CoreProtect;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Queue;
+import net.coreprotect.listener.player.InventoryChangeListener;
 import net.coreprotect.model.entity.EntityInteractionOrigin;
 import net.coreprotect.model.entity.EntitySpawnData;
 import net.coreprotect.paper.PaperAdapter;
+import net.coreprotect.spigot.SpigotAdapter;
 import net.coreprotect.thread.Scheduler;
 
 public final class EntitySpawnTracking {
@@ -71,7 +77,11 @@ public final class EntitySpawnTracking {
     }
 
     public static boolean isPlacedEntity(Entity entity) {
-        return entity instanceof Boat || entity instanceof Minecart;
+        return entity instanceof Boat || entity instanceof Minecart || isCushion(entity);
+    }
+
+    public static boolean isCushion(Entity entity) {
+        return entity != null && entity.getType() != null && entity.getType().name().equals("CUSHION");
     }
 
     public static boolean isPlacedEntityType(EntityType type) {
@@ -80,7 +90,7 @@ public final class EntitySpawnTracking {
         }
 
         Class<? extends Entity> entityClass = type.getEntityClass();
-        return entityClass != null && (Boat.class.isAssignableFrom(entityClass) || Minecart.class.isAssignableFrom(entityClass));
+        return type.name().equals("CUSHION") || (entityClass != null && (Boat.class.isAssignableFrom(entityClass) || Minecart.class.isAssignableFrom(entityClass)));
     }
 
     public static Set<Integer> getPlacedEntityTypeIds() {
@@ -226,7 +236,7 @@ public final class EntitySpawnTracking {
     }
 
     public static boolean isEligibleInteractionEntity(Entity entity) {
-        return entity instanceof LivingEntity && !(entity instanceof Player) && !(entity instanceof ArmorStand);
+        return (entity instanceof LivingEntity && !(entity instanceof Player) && !(entity instanceof ArmorStand)) || isCushion(entity);
     }
 
     public static void confirmDatabaseIdentity(UUID uuid, Location location) {
@@ -357,64 +367,101 @@ public final class EntitySpawnTracking {
         int maxChunkZ = radius[6] >> 4;
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(ENTITY_SCAN_TIMEOUT_SECONDS);
 
+        long[] chunks = chunksToScan(world, minChunkX, maxChunkX, minChunkZ, maxChunkZ, deadline);
         if (ConfigHandler.isFolia) {
-            scanFoliaChunks(world, radius, inside, minChunkX, maxChunkX, minChunkZ, maxChunkZ, deadline);
+            scanFoliaChunks(world, chunks, radius, inside, deadline);
             scanFoliaCandidates(world, radius, databaseCandidates, inside, loadedCandidates, deadline);
         }
         else {
             scanBukkitCandidates(world, radius, databaseCandidates, inside, loadedCandidates, deadline);
-            scanBukkitChunks(world, radius, inside, minChunkX, maxChunkX, minChunkZ, maxChunkZ, deadline);
+            scanBukkitChunks(world, chunks, radius, inside, deadline);
         }
 
         return new LoadedEntityRadius(inside, loadedCandidates);
     }
 
-    private static void scanFoliaChunks(World world, Integer[] radius, Set<UUID> inside, int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ, long deadline) throws Exception {
-        List<CompletableFuture<Void>> pending = new ArrayList<>(CHUNK_SCAN_BATCH_SIZE);
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
-            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
-                CompletableFuture<Void> completion = new CompletableFuture<>();
-                pending.add(completion);
-                int targetChunkX = chunkX;
-                int targetChunkZ = chunkZ;
-                Location chunkLocation = new Location(world, chunkX << 4, 0, chunkZ << 4);
-                try {
-                    Scheduler.runTask(CoreProtect.getInstance(), () -> {
-                        try {
-                            collectLoadedEntities(world, targetChunkX, targetChunkZ, radius, inside);
-                            completion.complete(null);
-                        }
-                        catch (Exception e) {
-                            completion.completeExceptionally(e);
-                        }
-                    }, chunkLocation);
+    private static long[] chunksToScan(World world, int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ, long deadline) throws Exception {
+        if (minChunkX > maxChunkX || minChunkZ > maxChunkZ) {
+            return new long[0];
+        }
+        long count = ((long) maxChunkX - minChunkX + 1) * ((long) maxChunkZ - minChunkZ + 1);
+        if (count <= CHUNK_SCAN_BATCH_SIZE) {
+            long[] chunks = new long[(int) count];
+            int index = 0;
+            for (int x = minChunkX; x <= maxChunkX; x++) {
+                for (int z = minChunkZ; z <= maxChunkZ; z++) {
+                    chunks[index++] = ((long) x << 32) | (z & 0xffffffffL);
                 }
-                catch (Exception e) {
-                    completion.completeExceptionally(e);
-                }
+            }
+            return chunks;
+        }
+        CompletableFuture<Chunk[]> completion = new CompletableFuture<>();
+        Scheduler.runTask(CoreProtect.getInstance(), () -> {
+            try {
+                completion.complete(world.getLoadedChunks());
+            }
+            catch (Exception e) {
+                completion.completeExceptionally(e);
+            }
+        });
+        await(completion, deadline);
+        Chunk[] loadedChunks = completion.join();
+        long[] chunks = new long[loadedChunks.length];
+        int size = 0;
+        for (Chunk chunk : loadedChunks) {
+            int x = chunk.getX();
+            int z = chunk.getZ();
+            if (x >= minChunkX && x <= maxChunkX && z >= minChunkZ && z <= maxChunkZ) {
+                chunks[size++] = ((long) x << 32) | (z & 0xffffffffL);
+            }
+        }
+        return Arrays.copyOf(chunks, size);
+    }
 
-                if (pending.size() == CHUNK_SCAN_BATCH_SIZE) {
-                    awaitAll(pending, deadline);
-                    pending.clear();
-                }
+    static void scanFoliaChunks(World world, long[] chunks, Integer[] radius, Set<UUID> inside, long deadline) throws Exception {
+        List<CompletableFuture<Void>> pending = new ArrayList<>(CHUNK_SCAN_BATCH_SIZE);
+        for (long chunk : chunks) {
+            int chunkX = (int) (chunk >> 32);
+            int chunkZ = (int) chunk;
+            CompletableFuture<Void> completion = new CompletableFuture<>();
+            pending.add(completion);
+            Location chunkLocation = new Location(world, chunkX << 4, 0, chunkZ << 4);
+            try {
+                Scheduler.runTask(CoreProtect.getInstance(), () -> {
+                    try {
+                        collectLoadedEntities(world, chunkX, chunkZ, radius, inside);
+                        completion.complete(null);
+                    }
+                    catch (Exception e) {
+                        completion.completeExceptionally(e);
+                    }
+                }, chunkLocation);
+            }
+            catch (Exception e) {
+                completion.completeExceptionally(e);
+            }
+
+            if (pending.size() == CHUNK_SCAN_BATCH_SIZE) {
+                awaitAll(pending, deadline);
+                pending.clear();
             }
         }
         awaitAll(pending, deadline);
     }
 
-    private static void scanBukkitChunks(World world, Integer[] radius, Set<UUID> inside, int minChunkX, int maxChunkX, int minChunkZ, int maxChunkZ, long deadline) throws Exception {
+    private static void scanBukkitChunks(World world, long[] chunks, Integer[] radius, Set<UUID> inside, long deadline) throws Exception {
         int[] chunkXs = new int[CHUNK_SCAN_BATCH_SIZE];
         int[] chunkZs = new int[CHUNK_SCAN_BATCH_SIZE];
         int batchSize = 0;
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
-            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
-                chunkXs[batchSize] = chunkX;
-                chunkZs[batchSize] = chunkZ;
-                batchSize++;
-                if (batchSize == CHUNK_SCAN_BATCH_SIZE) {
-                    scanBukkitChunkBatch(world, radius, inside, chunkXs, chunkZs, batchSize, deadline);
-                    batchSize = 0;
-                }
+        for (long chunk : chunks) {
+            int chunkX = (int) (chunk >> 32);
+            int chunkZ = (int) chunk;
+            chunkXs[batchSize] = chunkX;
+            chunkZs[batchSize] = chunkZ;
+            batchSize++;
+            if (batchSize == CHUNK_SCAN_BATCH_SIZE) {
+                scanBukkitChunkBatch(world, radius, inside, chunkXs, chunkZs, batchSize, deadline);
+                batchSize = 0;
             }
         }
         if (batchSize > 0) {
@@ -562,7 +609,7 @@ public final class EntitySpawnTracking {
         }
     }
 
-    private static void await(CompletableFuture<Void> completion, long deadline) throws Exception {
+    private static void await(CompletableFuture<?> completion, long deadline) throws Exception {
         long remaining = deadline - System.nanoTime();
         if (remaining <= 0L) {
             throw new TimeoutException("Timed out scanning loaded tracked entities");
@@ -736,7 +783,9 @@ public final class EntitySpawnTracking {
                     continue;
                 }
 
-                if (ConfigHandler.isFolia) {
+                // Folia grants the shutdown thread entity ownership after region ticking stops.
+                // Checkpoint owned entities directly: a newly scheduled task may never run during shutdown.
+                if (ConfigHandler.isFolia && !PaperAdapter.ADAPTER.isOwnedByCurrentRegion(entity)) {
                     completion = new CompletableFuture<>();
                     pending.add(completion);
                     CompletableFuture<Void> entityCompletion = completion;
@@ -946,12 +995,16 @@ public final class EntitySpawnTracking {
         state.add(entity.getCustomName());
         state.add(entity.isCustomNameVisible());
 
-        String boatType = null;
+        String variant = null;
         if (entity instanceof Boat) {
             TreeSpecies woodType = ((Boat) entity).getWoodType();
-            boatType = woodType == null ? null : woodType.name();
+            variant = woodType == null ? null : woodType.name();
         }
-        state.add(boatType);
+        else if (isCushion(entity)) {
+            DyeColor color = entity instanceof Colorable ? ((Colorable) entity).getColor() : SpigotAdapter.ADAPTER.getCushionColor(entity);
+            variant = color == null ? null : color.name();
+        }
+        state.add(variant);
 
         List<Object> inventoryData = null;
         if (entity instanceof InventoryHolder) {
@@ -978,6 +1031,10 @@ public final class EntitySpawnTracking {
             }
         }
         state.add(equipmentData);
+        if (isCushion(entity)) {
+            Location location = entity.getLocation();
+            state.add(Arrays.asList(location.getYaw(), location.getPitch()));
+        }
         trimTrailingNulls(state);
         return state;
     }
@@ -1058,6 +1115,15 @@ public final class EntitySpawnTracking {
             catch (Exception ignored) {
             }
         }
+        else if (isCushion(entity) && state.size() > 2 && state.get(2) instanceof String) {
+            DyeColor color = DyeColor.valueOf((String) state.get(2));
+            if (entity instanceof Colorable) {
+                ((Colorable) entity).setColor(color);
+            }
+            else {
+                SpigotAdapter.ADAPTER.setCushionColor(entity, color);
+            }
+        }
         if (entity instanceof InventoryHolder && state.size() > 3 && state.get(3) instanceof List<?>) {
             Inventory inventory = ((InventoryHolder) entity).getInventory();
             List<?> inventoryData = (List<?>) state.get(3);
@@ -1077,6 +1143,12 @@ public final class EntitySpawnTracking {
                 equipment.setLeggings(getItem(equipmentData, 3));
                 equipment.setChestplate(getItem(equipmentData, 4));
                 equipment.setHelmet(getItem(equipmentData, 5));
+            }
+        }
+        if (isCushion(entity) && state.size() > 5 && state.get(5) instanceof List<?>) {
+            List<?> rotation = (List<?>) state.get(5);
+            if (rotation.size() == 2 && rotation.get(0) instanceof Number && rotation.get(1) instanceof Number) {
+                entity.setRotation(((Number) rotation.get(0)).floatValue(), ((Number) rotation.get(1)).floatValue());
             }
         }
     }
@@ -1440,6 +1512,7 @@ public final class EntitySpawnTracking {
     }
 
     private static void checkpointLoadedEntity(UUID uuid, Entity entity) {
+        InventoryChangeListener.flushEntityContainer(entity);
         Location location = entity.getLocation();
         long[] updateEpoch = { -1L };
         trackedLocations.computeIfPresent(uuid, (key, tracked) -> {

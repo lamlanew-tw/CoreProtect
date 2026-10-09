@@ -42,6 +42,10 @@ public final class EntityChangeBlockListener extends Queue implements Listener {
         Material newtype = event.getTo();
         Material type = event.getBlock().getType();
 
+        if (type == newtype && (type == Material.REDSTONE_ORE || type.name().equals("DEEPSLATE_REDSTONE_ORE") || type.name().equals("BIG_DRIPLEAF"))) {
+            return;
+        }
+
         if (entity instanceof FallingBlock) {
             if (!config.BLOCK_MOVEMENT) {
                 CacheHandler.fallingBlockSpawnCache.remove(entity.getUniqueId().toString());

@@ -1,6 +1,5 @@
 package net.coreprotect.database.rollback;
 
-import java.io.ByteArrayInputStream;
 import java.util.List;
 import java.util.Map;
 
@@ -32,13 +31,13 @@ import org.bukkit.inventory.meta.MapMeta;
 import org.bukkit.inventory.meta.PotionMeta;
 import org.bukkit.inventory.meta.SuspiciousStewMeta;
 import org.bukkit.potion.PotionEffect;
-import org.bukkit.util.io.BukkitObjectInputStream;
 
 import net.coreprotect.bukkit.BukkitAdapter;
 import net.coreprotect.consumer.Queue;
 import net.coreprotect.database.Lookup;
 import net.coreprotect.database.statement.BlockStatement;
 import net.coreprotect.model.BlockGroup;
+import net.coreprotect.utility.AttributeUtils;
 import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.ErrorReporter;
 
@@ -364,19 +363,12 @@ public class RollbackUtil extends Lookup {
                         Map<Object, Map<String, Object>> modifiersMap = (Map<Object, Map<String, Object>>) item;
                         for (Map.Entry<Object, Map<String, Object>> entry : modifiersMap.entrySet()) {
                             try {
-                                Attribute attribute = null;
-                                if (entry.getKey() instanceof Attribute) {
-                                    attribute = (Attribute) entry.getKey();
-                                }
-                                else {
-                                    attribute = (Attribute) BukkitAdapter.ADAPTER.getRegistryValue((String) entry.getKey(), Attribute.class);
-                                }
-
+                                Attribute attribute = AttributeUtils.resolve(entry.getKey());
                                 AttributeModifier modifier = AttributeModifier.deserialize(entry.getValue());
                                 itemMeta.addAttributeModifier(attribute, modifier);
                             }
                             catch (IllegalArgumentException e) {
-                                // AttributeModifier already exists
+                                // Attribute is unavailable or the modifier cannot be applied.
                             }
                         }
                     }
@@ -487,22 +479,8 @@ public class RollbackUtil extends Lookup {
     }
 
     public static Object[] populateItemStack(ItemStack itemstack, byte[] metadata) {
-        if (metadata != null) {
-            try {
-                ByteArrayInputStream metaByteStream = new ByteArrayInputStream(metadata);
-                BukkitObjectInputStream metaObjectStream = new BukkitObjectInputStream(metaByteStream);
-                Object metaList = metaObjectStream.readObject();
-                metaObjectStream.close();
-                metaByteStream.close();
-
-                return populateItemStack(itemstack, metaList);
-            }
-            catch (Exception e) {
-                ErrorReporter.report(e);
-            }
-        }
-
-        return new Object[] { 0, "", itemstack };
+        List<Object> metaList = deserializeMetadata(metadata);
+        return metaList == null ? new Object[] { 0, "", itemstack } : populateItemStack(itemstack, metaList);
     }
 
     /**

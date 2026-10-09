@@ -16,6 +16,7 @@ import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.database.Database;
 import net.coreprotect.database.DuckDBLookupQuery;
+import net.coreprotect.database.LocationQuery;
 import net.coreprotect.database.statement.UserStatement;
 import net.coreprotect.utility.BlockUtils;
 import net.coreprotect.utility.DatabaseUtils;
@@ -75,7 +76,7 @@ public class BlockAPI {
             try (Statement statement = connection.createStatement()) {
                 String table = DuckDBLookupQuery.spatialTable(connection, "block", worldId, x, x, z, z, "spatial_rows");
                 String index = ConfigHandler.databaseType.isDuckDB() ? "" : WorldUtils.getWidIndex("block");
-                String query = "SELECT time," + ConfigHandler.databaseType.getUserColumn() + ",action,type,data,blockdata,rolled_back FROM " + table + " " + index + "WHERE wid = " + worldId + " AND x = " + x + " AND z = " + z + " AND y = " + y + " AND time > " + checkTime + " ORDER BY " + ConfigHandler.getDescendingEventOrder();
+                String query = "SELECT time," + ConfigHandler.databaseType.getUserColumn() + ",action,type,data,blockdata,rolled_back FROM " + table + " " + index + "WHERE " + LocationQuery.predicate("wid", " = " + worldId) + " AND " + LocationQuery.predicate("x", " = " + x) + " AND " + LocationQuery.predicate("z", " = " + z) + " AND y = " + y + " AND time > " + checkTime + " ORDER BY " + ConfigHandler.getDescendingEventOrder();
 
                 try (ResultSet results = statement.executeQuery(query)) {
                     while (results.next()) {
@@ -110,17 +111,40 @@ public class BlockAPI {
      * @param block
      *            The block to look up
      * @param options
-     *            Lookup options. User, time, and limit are applied; location and radius are ignored because the block supplies the exact location.
+     *            Lookup options. World, location, and radius are ignored because the block supplies the exact location.
      * @return List of results in a BlockResult format
      */
     public static List<BlockResult> performLookup(Block block, LookupOptions options) {
+        if (!Config.getGlobal().API_ENABLED || block == null || block.getWorld() == null) {
+            return new ArrayList<>();
+        }
+
+        if (options == null) {
+            options = LookupOptions.builder().build();
+        }
+
+        return performLookup(LookupOptions.builder().location(block.getLocation())
+                .user(options.getUser()).users(options.getUsers()).excludeUsers(options.getExcludeUsers())
+                .time(options.getTime()).limit(options.getLimitOffset(), options.getLimitCount())
+                .includeMaterials(options.getIncludeMaterials()).excludeMaterials(options.getExcludeMaterials())
+                .blockActions(options.getBlockActions()).build(), false);
+    }
+
+    /**
+     * Performs a typed lookup of block-related actions using shared lookup options.
+     *
+     * @param options
+     *            Lookup options
+     * @return List of results in a BlockResult format
+     */
+    public static List<BlockResult> performLookup(LookupOptions options) {
+        return performLookup(options, true);
+    }
+
+    private static List<BlockResult> performLookup(LookupOptions options, boolean blocksOnly) {
         List<BlockResult> result = new ArrayList<>();
 
         if (!Config.getGlobal().API_ENABLED) {
-            return result;
-        }
-
-        if (block == null || block.getWorld() == null) {
             return result;
         }
 
@@ -133,49 +157,31 @@ public class BlockAPI {
                 return result;
             }
 
-            Integer userId = MessageAPI.getUserId(connection, options.getUser());
-            if (userId != null && userId == -1) {
+            LookupFilter filter = LookupFilter.fromOptions(connection, options);
+            if (filter.hasInvalidUser() || filter.hasInvalidLocation()) {
                 return result;
             }
 
-            int checkTime = 0;
-            if (options.getTime() > 0) {
-                checkTime = (int) (System.currentTimeMillis() / 1000L) - options.getTime();
-            }
-
-            int x = block.getX();
-            int y = block.getY();
-            int z = block.getZ();
-            String worldName = block.getWorld().getName();
-            int worldId = WorldUtils.getWorldId(worldName);
-
             StringBuilder query = new StringBuilder("SELECT time," + ConfigHandler.databaseType.getUserColumn() + ",action,type,data,blockdata,rolled_back,wid,x,y,z FROM ");
-            query.append(DuckDBLookupQuery.spatialTable(connection, "block", worldId, x, x, z, z, "spatial_rows")).append(' ');
-            if (!ConfigHandler.databaseType.isDuckDB()) {
+            query.append(filter.table(connection, "block", "")).append(' ');
+            if (filter.hasLocation() && !ConfigHandler.databaseType.isDuckDB()) {
                 query.append(WorldUtils.getWidIndex("block"));
             }
-            query.append("WHERE wid = ? AND x = ? AND z = ? AND y = ? AND time > ?");
-            if (userId != null) {
-                query.append(" AND ").append(ConfigHandler.databaseType.getUserColumn()).append(" = ?");
-            }
+            filter.appendWhere(query);
+            filter.appendBlockMaterialWhere(query);
+            int[] actions = blocksOnly && options.getBlockActions().isEmpty()
+                    ? new int[] { BlockAction.BREAK.id(), BlockAction.PLACE.id(), BlockAction.INTERACTION.id() }
+                    : options.getBlockActions().stream().mapToInt(BlockAction::id).toArray();
+            LookupFilter.appendActionWhere(query, "", actions);
             query.append(" ORDER BY ").append(ConfigHandler.getDescendingEventOrder());
-            if (options.hasLimit()) {
-                query.append(" LIMIT ").append(options.getLimitCount()).append(" OFFSET ").append(options.getLimitOffset());
-            }
+            filter.appendLimit(query);
 
             try (PreparedStatement statement = connection.prepareStatement(query.toString())) {
-                statement.setInt(1, worldId);
-                statement.setInt(2, x);
-                statement.setInt(3, z);
-                statement.setInt(4, y);
-                statement.setInt(5, checkTime);
-                if (userId != null) {
-                    statement.setInt(6, userId);
-                }
+                filter.bind(statement);
 
                 try (ResultSet results = statement.executeQuery()) {
                     while (results.next()) {
-                        result.add(parseBlockResult(connection, results, worldName));
+                        result.add(parseBlockResult(connection, results, WorldUtils.getWorldName(results.getInt("wid"))));
                     }
                 }
             }
@@ -219,6 +225,10 @@ public class BlockAPI {
             return result;
         }
 
+        if (options == null) {
+            options = LookupOptions.builder().build();
+        }
+
         try (Connection connection = Database.getConnection(false, 1000)) {
             if (connection == null) {
                 return result;
@@ -233,8 +243,13 @@ public class BlockAPI {
             try {
                 StringBuilder containerWhere = new StringBuilder();
                 filter.appendWhere(containerWhere, "container_rows");
+                filter.appendMaterialWhere(containerWhere, "container_rows");
+                int[] actions = options.getContainerActions().stream().mapToInt(ContainerAction::id).toArray();
+                LookupFilter.appendActionWhere(containerWhere, "container_rows", actions);
                 StringBuilder entityWhere = new StringBuilder();
                 filter.appendEntityContainerWhere(entityWhere, "entity_rows", "spawn_rows");
+                filter.appendMaterialWhere(entityWhere, "entity_rows");
+                LookupFilter.appendActionWhere(entityWhere, "entity_rows", actions);
 
                 StringBuilder query = new StringBuilder("SELECT * FROM (");
                 query.append("SELECT 0 AS source,container_rows.rowid AS id,container_rows.time,container_rows.").append(ConfigHandler.databaseType.getUserColumn()).append(",container_rows.wid,container_rows.x,container_rows.y,container_rows.z,container_rows.action,container_rows.type,container_rows.data,container_rows.amount,container_rows.metadata,container_rows.rolled_back FROM ")

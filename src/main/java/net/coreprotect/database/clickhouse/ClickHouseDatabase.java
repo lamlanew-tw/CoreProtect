@@ -19,8 +19,10 @@ import net.coreprotect.database.ConsumerWriteBatch.ReferenceKind;
 
 public final class ClickHouseDatabase implements AutoCloseable {
 
-    private static final int MINIMUM_SERVER_MAJOR = 25;
-    private static final int MINIMUM_SERVER_MINOR = 6;
+    public static final String USER_NAME_ORDER = "(uuid!='') DESC,time DESC,rowid DESC";
+
+    private static final int MINIMUM_SERVER_MAJOR = 26;
+    private static final int MINIMUM_SERVER_MINOR = 1;
 
     private final ClickHouseJdbc jdbc;
     private final String database;
@@ -37,7 +39,7 @@ public final class ClickHouseDatabase implements AutoCloseable {
     private boolean closed;
 
     private ClickHouseDatabase(ClickHouseJdbc jdbc, ClickHouseNativeClient nativeClient, String database, String prefix, UUID datasetId,
-            ClickHouseIdentityAllocator identityAllocator, ClickHouseIdentityReservation identifierReservation, ClickHouseWriterRegistration writerRegistration) {
+            ClickHouseIdentityAllocator identityAllocator, ClickHouseIdentityReservation identifierReservation, ClickHouseWriterRegistration writerRegistration) throws SQLException {
         this.jdbc = jdbc;
         this.nativeClient = nativeClient;
         this.database = database;
@@ -48,7 +50,7 @@ public final class ClickHouseDatabase implements AutoCloseable {
         this.writerRegistration = writerRegistration;
         publisher = new ClickHouseBatchPublisher(jdbc, nativeClient, writerRegistration, database, prefix);
         highWaterPublisher = new ClickHouseHighWaterPublisher(jdbc, nativeClient, writerRegistration, database, prefix);
-        retention = new ClickHouseRetention(jdbc, database, prefix);
+        retention = new ClickHouseRetention(jdbc, database, prefix, writerRegistration.schemaOwner());
         targetResolver = new ClickHouseTargetResolver(jdbc, database, prefix, datasetId);
     }
 
@@ -78,8 +80,12 @@ public final class ClickHouseDatabase implements AutoCloseable {
                 for (int index = 0; index < ClickHouseSchema.PHYSICAL_TABLE_COUNT; index++) {
                     jdbc.executeDdl(connection, statements.get(index));
                 }
+                try (Connection patch = ClickHouseJdbc.openPatchConnection(config)) {
+                    net.coreprotect.patch.script.__2_25_1.upgradeClickHouseSchema(patch, config.getDatabase(), validatedPrefix, writerRegistration.schemaOwner());
+                }
                 ClickHouseSchema.validatePhysicalSchema(connection, config.getDatabase(), validatedPrefix);
                 storageIdentity = loadStorageIdentity(connection, config.getDatabase(), validatedPrefix);
+                ClickHouseLookupIndex.recover(connection, config.getDatabase(), validatedPrefix, writerRegistration.schemaOwner());
                 for (int index = ClickHouseSchema.PHYSICAL_TABLE_COUNT; index < statements.size(); index++) {
                     jdbc.executeDdl(connection, statements.get(index));
                 }
@@ -220,7 +226,14 @@ public final class ClickHouseDatabase implements AutoCloseable {
         String normalizedUser = Objects.requireNonNull(user, "user").toLowerCase(Locale.ROOT);
         String normalizedUuid = Objects.requireNonNull(uuid, "uuid");
         if (Config.getGlobal().DATABASE_LOCK) {
-            long id = existingId != null ? existingId : identityAllocator.nextRowId(ClickHouseFamily.USER);
+            Integer candidate = existingId;
+            if (existingId != null && !normalizedUuid.isEmpty()) {
+                UserIdentity existing = readUserIdentity(existingId);
+                if (existing != null && !existing.uuid.isEmpty() && !normalizedUuid.equals(existing.uuid)) {
+                    candidate = null;
+                }
+            }
+            long id = candidate != null ? candidate : identityAllocator.nextRowId(ClickHouseFamily.USER);
             return toIdentifier(id, ClickHouseFamily.USER.getTableName());
         }
         String nameIdentity = "canonical:user:name:" + normalizedUser;
@@ -228,19 +241,85 @@ public final class ClickHouseDatabase implements AutoCloseable {
             if (existingId != null) {
                 return existingId;
             }
-            return toIdentifier(identifierReservation.canonicalId(nameIdentity,
-                    () -> identityAllocator.nextRowId(ClickHouseFamily.USER)),
-                    ClickHouseFamily.USER.getTableName());
+            return toIdentifier(canonicalNameUserId(normalizedUser, normalizedUuid), ClickHouseFamily.USER.getTableName());
         }
 
+        UUID ownerUuid = UUID.fromString(normalizedUuid);
         String uuidIdentity = "canonical:user:uuid:" + normalizedUuid;
         long uuidId = identifierReservation.canonicalId(uuidIdentity,
-                () -> existingId != null
-                        ? existingId
-                        : identifierReservation.canonicalId(nameIdentity,
-                                () -> identityAllocator.nextRowId(ClickHouseFamily.USER)));
+                () -> {
+                    if (existingId != null) {
+                        UserIdentity existing = readUserIdentity(existingId);
+                        if ((existing == null || existing.uuid.isEmpty() || normalizedUuid.equals(existing.uuid))
+                                && identifierReservation.claimUserOwner(existingId, ownerUuid)) {
+                            return existingId;
+                        }
+                    }
+                    return canonicalNameUserId(normalizedUser, normalizedUuid);
+                });
+        if (!identifierReservation.claimUserOwner(uuidId, ownerUuid)) {
+            throw new SQLException("ClickHouse user identity " + uuidId + " belongs to another UUID");
+        }
         identifierReservation.canonicalId(nameIdentity, uuidId);
         return toIdentifier(uuidId, ClickHouseFamily.USER.getTableName());
+    }
+
+    private long canonicalNameUserId(String user, String uuid) throws SQLException {
+        if (uuid.isEmpty()) {
+            String table = ClickHouseIdentifiers.qualified(database, prefix + ClickHouseFamily.USER.getTableName());
+            try (Connection connection = jdbc.openAuxiliaryConnection(); PreparedStatement statement = connection.prepareStatement(
+                    "SELECT rowid FROM " + table + " WHERE lowerUTF8(`user`)=lowerUTF8(?) ORDER BY " + USER_NAME_ORDER + " LIMIT 1")) {
+                statement.setString(1, user);
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    if (resultSet.next()) {
+                        return resultSet.getLong(1);
+                    }
+                }
+            }
+        }
+        String nameIdentity = "canonical:user:name:" + user;
+        String identity = nameIdentity;
+        UUID ownerUuid = uuid.isEmpty() ? null : UUID.fromString(uuid);
+        while (true) {
+            long id = identifierReservation.canonicalId(identity, () -> identityAllocator.nextRowId(ClickHouseFamily.USER));
+            UserIdentity existing = readUserIdentity(id);
+            if (existing == null || user.equals(existing.name.toLowerCase(Locale.ROOT))) {
+                if (ownerUuid == null) {
+                    return id;
+                }
+                if ((existing == null || existing.uuid.isEmpty() || uuid.equals(existing.uuid))
+                        && identifierReservation.claimUserOwner(id, ownerUuid)) {
+                    return id;
+                }
+            }
+            identity = nameIdentity + ":after:" + id;
+        }
+    }
+
+    private UserIdentity readUserIdentity(long rowId) throws SQLException {
+        String table = ClickHouseIdentifiers.qualified(database, prefix + ClickHouseFamily.USER.getTableName());
+        try (Connection connection = jdbc.openAuxiliaryConnection(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT `user`,uuid FROM " + table + " WHERE rowid=? LIMIT 1")) {
+            statement.setLong(1, rowId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return null;
+                }
+                String uuid = resultSet.getString(2);
+                return new UserIdentity(resultSet.getString(1), uuid == null ? "" : uuid);
+            }
+        }
+    }
+
+    private static final class UserIdentity {
+
+        private final String name;
+        private final String uuid;
+
+        private UserIdentity(String name, String uuid) {
+            this.name = name;
+            this.uuid = uuid;
+        }
     }
 
     private static int toIdentifier(long id, String family) throws SQLException {
@@ -403,7 +482,7 @@ public final class ClickHouseDatabase implements AutoCloseable {
         return version;
     }
 
-    private static void requireServerVersion(Connection connection) throws SQLException {
+    static void requireServerVersion(Connection connection) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement("SELECT version()"); ResultSet resultSet = statement.executeQuery()) {
             if (!resultSet.next()) {
                 throw new SQLException("ClickHouse did not return its server version");

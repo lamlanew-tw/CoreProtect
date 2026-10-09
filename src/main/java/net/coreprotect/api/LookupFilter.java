@@ -5,30 +5,54 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.StringJoiner;
+import java.util.stream.Collectors;
 
 import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.World;
 
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.database.DuckDBLookupQuery;
 import net.coreprotect.database.DuckDBSpatialIndex;
+import net.coreprotect.database.LocationQuery;
+import net.coreprotect.model.action.LookupActions;
+import net.coreprotect.utility.ItemUtils;
+import net.coreprotect.utility.MaterialUtils;
+import net.coreprotect.utility.StringUtils;
 import net.coreprotect.utility.WorldUtils;
 
 final class LookupFilter {
     private final Integer userId;
     private final int checkTime;
     private final Location location;
+    private final World world;
     private final int radius;
     private final int limitOffset;
     private final int limitCount;
+    private final List<Material> includeMaterials;
+    private final List<Material> excludeMaterials;
+    private final Map<Integer, Material> materialTypes;
+    private final String includeUserIds;
+    private final String excludeUserIds;
 
-    private LookupFilter(Integer userId, int checkTime, Location location, int radius, int limitOffset, int limitCount) {
+    private LookupFilter(Integer userId, int checkTime, Location location, World world, int radius, int limitOffset, int limitCount, List<Material> includeMaterials, List<Material> excludeMaterials, Map<Integer, Material> materialTypes, String includeUserIds, String excludeUserIds) {
         this.userId = userId;
         this.checkTime = checkTime;
         this.location = location;
+        this.world = location == null ? world : location.getWorld();
         this.radius = radius;
         this.limitOffset = limitOffset;
         this.limitCount = limitCount;
+        this.includeMaterials = includeMaterials;
+        this.excludeMaterials = excludeMaterials;
+        this.materialTypes = materialTypes;
+        this.includeUserIds = includeUserIds;
+        this.excludeUserIds = excludeUserIds;
     }
 
     static LookupFilter fromOptions(Connection connection, LookupOptions options) throws Exception {
@@ -42,7 +66,19 @@ final class LookupFilter {
             checkTime = (int) (System.currentTimeMillis() / 1000L) - options.getTime();
         }
 
-        return new LookupFilter(userId, checkTime, options.getLocation(), options.getRadius(), options.getLimitOffset(), options.getLimitCount());
+        Map<Integer, Material> materialTypes = new HashMap<>();
+        if (!options.getIncludeMaterials().isEmpty() || !options.getExcludeMaterials().isEmpty()) {
+            try (PreparedStatement statement = connection.prepareStatement("SELECT id, material FROM " + ConfigHandler.prefix + "material_map");
+                    ResultSet results = statement.executeQuery()) {
+                while (results.next()) {
+                    materialTypes.put(results.getInt("id"), MaterialUtils.getTypeFromStoredName(results.getString("material")));
+                }
+            }
+        }
+
+        return new LookupFilter(userId, checkTime, options.getLocation(), options.getWorld(), options.getRadius(), options.getLimitOffset(), options.getLimitCount(),
+                options.getIncludeMaterials(), options.getExcludeMaterials(), materialTypes,
+                userIds(connection, options.getUsers()), userIds(connection, options.getExcludeUsers()));
     }
 
     boolean hasInvalidUser() {
@@ -88,45 +124,159 @@ final class LookupFilter {
         if (userId != null) {
             query.append(" AND ").append(qualifier).append(ConfigHandler.databaseType.getUserColumn()).append(" = ?");
         }
+        appendUserWhere(query, alias, includeUserIds, excludeUserIds);
 
+        if (world != null) {
+            query.append(" AND ").append(LocationQuery.predicate(qualifier + "wid", " = ?"));
+        }
         if (location != null) {
-            query.append(" AND ").append(qualifier).append("wid = ?");
             if (radius > 0) {
-                query.append(" AND ").append(qualifier).append("x >= ? AND ").append(qualifier).append("x <= ? AND ").append(qualifier).append("z >= ? AND ").append(qualifier).append("z <= ?");
+                query.append(" AND ").append(LocationQuery.predicate(qualifier + "x", " >= ?"))
+                        .append(" AND ").append(LocationQuery.predicate(qualifier + "x", " <= ?"))
+                        .append(" AND ").append(LocationQuery.predicate(qualifier + "z", " >= ?"))
+                        .append(" AND ").append(LocationQuery.predicate(qualifier + "z", " <= ?"));
             }
             else {
-                query.append(" AND ").append(qualifier).append("x = ? AND ").append(qualifier).append("y = ? AND ").append(qualifier).append("z = ?");
+                query.append(" AND ").append(LocationQuery.predicate(qualifier + "x", " = ?"))
+                        .append(" AND ").append(qualifier).append("y = ? AND ").append(LocationQuery.predicate(qualifier + "z", " = ?"));
             }
         }
     }
 
     void appendEntityContainerWhere(StringBuilder query, String transactionAlias, String entityAlias) {
+        appendTrackedEntityWhere(query, transactionAlias, entityAlias, null);
+    }
+
+    void appendEntityWhere(Connection connection, StringBuilder query, String alias) {
+        appendTrackedEntityWhere(query, alias, "spawn_rows", table(connection, "block", "original_rows"));
+    }
+
+    private void appendTrackedEntityWhere(StringBuilder query, String transactionAlias, String entityAlias, String originalTable) {
         String transaction = transactionAlias + ".";
         String entity = entityAlias + ".";
         query.append("WHERE ").append(transaction).append("time > ?");
         if (userId != null) {
             query.append(" AND ").append(transaction).append(ConfigHandler.databaseType.getUserColumn()).append(" = ?");
         }
-        if (location == null) {
+        appendUserWhere(query, transactionAlias, includeUserIds, excludeUserIds);
+        if (world == null) {
             return;
         }
 
-        query.append(" AND ((").append(transaction).append("wid = ?");
-        if (radius > 0) {
-            query.append(" AND ").append(transaction).append("x >= ? AND ").append(transaction).append("x <= ? AND ").append(transaction).append("z >= ? AND ").append(transaction).append("z <= ?");
+        String original = originalTable == null ? transaction : "original_rows.";
+        String tracked = ") OR (";
+        String ending = "))";
+        if (originalTable != null) {
+            String trackingId = ConfigHandler.databaseType.isClickHouse() ? "accurateCastOrNull(linked_rows.data, 'UInt64')" : "linked_rows.data";
+            String trackedRows = "SELECT " + entity + "block_rowid FROM " + ConfigHandler.prefix + "entity_spawn " + entityAlias
+                    + " INNER JOIN " + ConfigHandler.prefix + "block linked_rows ON linked_rows.rowid=" + entity + "block_rowid AND " + trackingId + "=" + entity + "rowid"
+                    + " AND linked_rows.action=" + LookupActions.ENTITY_SPAWN + " WHERE (";
+            if (location == null) {
+                query.append(" AND (").append(LocationQuery.predicate(transaction + "wid", " = ?"))
+                        .append(" OR ").append(transaction).append("rowid IN (").append(trackedRows).append(entity).append("current_wid = ?)))");
+                return;
+            }
+            // Separate location candidates keep both spatial indexes usable, including on MySQL.
+            query.append(" AND ").append(transaction).append("rowid IN (SELECT rowid FROM (SELECT original_rows.rowid FROM ").append(originalTable).append(" WHERE (");
+            tracked = ") UNION ALL " + trackedRows;
+            ending = ")) entity_locations)";
         }
         else {
-            query.append(" AND ").append(transaction).append("x = ? AND ").append(transaction).append("y = ? AND ").append(transaction).append("z = ?");
+            query.append(" AND ((");
         }
 
-        query.append(") OR (").append(entity).append("current_wid = ?");
+        query.append(LocationQuery.predicate(original + "wid", " = ?"));
+        if (location == null) {
+            query.append(tracked).append(entity).append("current_wid = ?").append(ending);
+            return;
+        }
+
+        if (radius > 0) {
+            query.append(" AND ").append(LocationQuery.predicate(original + "x", " >= ?"))
+                    .append(" AND ").append(LocationQuery.predicate(original + "x", " <= ?"))
+                    .append(" AND ").append(LocationQuery.predicate(original + "z", " >= ?"))
+                    .append(" AND ").append(LocationQuery.predicate(original + "z", " <= ?"));
+        }
+        else {
+            query.append(" AND ").append(LocationQuery.predicate(original + "x", " = ?"))
+                    .append(" AND ").append(original).append("y = ? AND ").append(LocationQuery.predicate(original + "z", " = ?"));
+        }
+
+        query.append(tracked).append(entity).append("current_wid = ?");
         if (radius > 0) {
             query.append(" AND ").append(entity).append("x >= ? AND ").append(entity).append("x < ? AND ").append(entity).append("z >= ? AND ").append(entity).append("z < ?");
         }
         else {
             query.append(" AND ").append(entity).append("x >= ? AND ").append(entity).append("x < ? AND ").append(entity).append("y >= ? AND ").append(entity).append("y < ? AND ").append(entity).append("z >= ? AND ").append(entity).append("z < ?");
         }
-        query.append("))");
+        query.append(ending);
+    }
+
+    static void appendActionWhere(StringBuilder query, String alias, int[] actions) {
+        if (actions.length > 0) {
+            StringJoiner ids = new StringJoiner(",");
+            for (int action : actions) {
+                ids.add(String.valueOf(action));
+            }
+            query.append(" AND ").append(alias.isEmpty() ? "" : alias + ".").append("action IN (").append(ids).append(")");
+        }
+    }
+
+    void appendMaterialWhere(StringBuilder query) {
+        appendMaterialWhere(query, "");
+    }
+
+    void appendMaterialWhere(StringBuilder query, String alias) {
+        appendMaterialWhere(query, alias, false);
+    }
+
+    void appendMaterialWhere(StringBuilder query, String alias, boolean inventoryBlock) {
+        String qualifier = alias.isEmpty() ? "" : alias + ".";
+        if (!includeMaterials.isEmpty()) {
+            query.append(" AND ").append(qualifier).append("type IN (").append(materialIds(includeMaterials, inventoryBlock)).append(")");
+        }
+        if (!excludeMaterials.isEmpty()) {
+            query.append(" AND ").append(qualifier).append("type NOT IN (").append(materialIds(excludeMaterials, inventoryBlock)).append(")");
+        }
+    }
+
+    void appendBlockMaterialWhere(StringBuilder query) {
+        String entityActions = LookupActions.ENTITY_KILL + "," + LookupActions.ENTITY_SPAWN;
+        if (!includeMaterials.isEmpty()) {
+            query.append(" AND action NOT IN (").append(entityActions).append(") AND ").append(blockMaterialPredicate(includeMaterials));
+        }
+        if (!excludeMaterials.isEmpty()) {
+            query.append(" AND (action IN (").append(entityActions).append(") OR NOT ").append(blockMaterialPredicate(excludeMaterials)).append(")");
+        }
+    }
+
+    private String blockMaterialPredicate(List<Material> materials) {
+        List<Material> blockMaterials = new ArrayList<>(materials);
+        blockMaterials.removeAll(List.of(Material.STONE));
+        return "(type IN (" + materialIds(blockMaterials, false) + ") OR " + legacyStonePredicate(materials) + ")";
+    }
+
+    private String legacyStonePredicate(List<Material> materials) {
+        StringJoiner stoneData = new StringJoiner(",");
+        for (int data = 1; data <= 6; data++) {
+            Material material = Material.getMaterial(StringUtils.nameFilter("stone", data).toUpperCase(Locale.ROOT));
+            if (materials.contains(material)) {
+                stoneData.add(String.valueOf(data));
+            }
+        }
+
+        StringJoiner predicates = new StringJoiner(" OR ");
+        if (materials.contains(Material.STONE)) {
+            predicates.add("COALESCE(data,0) NOT BETWEEN 1 AND 6");
+        }
+        if (stoneData.length() > 0) {
+            predicates.add("COALESCE(data,0) IN (" + stoneData + ")");
+        }
+        if (predicates.length() == 0) {
+            return "1 = 0";
+        }
+
+        return "(type IN (" + materialIds(List.of(Material.STONE), false) + ") AND (" + predicates + "))";
     }
 
     String table(Connection connection, String table, String alias) {
@@ -145,8 +295,16 @@ final class LookupFilter {
     }
 
     String entityContainerTable(Connection connection, String alias) throws Exception {
+        return trackedEntityTable(connection, "entity_container", alias);
+    }
+
+    String entityTable(Connection connection, String alias) throws Exception {
+        return trackedEntityTable(connection, "block", alias);
+    }
+
+    private String trackedEntityTable(Connection connection, String table, String alias) throws Exception {
         if (location == null || !ConfigHandler.databaseType.isDuckDB()) {
-            return ConfigHandler.prefix + "entity_container" + alias(alias);
+            return ConfigHandler.prefix + table + alias(alias);
         }
 
         int x = location.getBlockX();
@@ -156,25 +314,26 @@ final class LookupFilter {
         int minimumZ = radius > 0 ? MessageAPI.clampToInt((long) z - radius) : z;
         int maximumZ = radius > 0 ? MessageAPI.clampToInt((long) z + radius) : z;
         int worldId = WorldUtils.getWorldId(location.getWorld().getName());
-        List<Integer> entitySpawnRowIds = loadCurrentEntitySpawnRowIds(connection);
+        boolean block = table.equals("block");
+        List<Long> rowIds = loadCurrentEntityRowIds(connection, block ? "block_rowid" : "rowid");
         return DuckDBSpatialIndex.tableExpression(
                 connection,
                 ConfigHandler.prefix,
-                "entity_container",
+                table,
                 worldId,
                 minimumX,
                 maximumX,
                 minimumZ,
                 maximumZ,
-                entitySpawnRowIds,
-                Collections.emptySet(),
+                block ? Collections.emptySet() : rowIds.stream().map(Long::intValue).collect(Collectors.toList()),
+                block ? rowIds : Collections.emptySet(),
                 alias
         );
     }
 
-    private List<Integer> loadCurrentEntitySpawnRowIds(Connection connection) throws Exception {
-        List<Integer> rowIds = new ArrayList<>();
-        StringBuilder query = new StringBuilder("SELECT rowid FROM ").append(ConfigHandler.prefix).append("entity_spawn WHERE current_wid=?");
+    private List<Long> loadCurrentEntityRowIds(Connection connection, String column) throws Exception {
+        List<Long> rowIds = new ArrayList<>();
+        StringBuilder query = new StringBuilder("SELECT ").append(column).append(" FROM ").append(ConfigHandler.prefix).append("entity_spawn WHERE current_wid=?");
         if (radius > 0) {
             query.append(" AND x>=? AND x<? AND z>=? AND z<?");
         }
@@ -207,7 +366,10 @@ final class LookupFilter {
             }
             try (ResultSet resultSet = statement.executeQuery()) {
                 while (resultSet.next() && rowIds.size() <= 4_096) {
-                    rowIds.add(resultSet.getInt(1));
+                    long rowId = resultSet.getLong(1);
+                    if (!resultSet.wasNull()) {
+                        rowIds.add(rowId);
+                    }
                 }
             }
         }
@@ -231,12 +393,14 @@ final class LookupFilter {
             statement.setInt(parameterIndex++, userId);
         }
 
+        if (world != null) {
+            statement.setInt(parameterIndex++, WorldUtils.getWorldId(world.getName()));
+        }
+
         if (location != null) {
             int x = location.getBlockX();
             int y = location.getBlockY();
             int z = location.getBlockZ();
-            statement.setInt(parameterIndex++, WorldUtils.getWorldId(location.getWorld().getName()));
-
             if (radius > 0) {
                 statement.setInt(parameterIndex++, MessageAPI.clampToInt((long) x - radius));
                 statement.setInt(parameterIndex++, MessageAPI.clampToInt((long) x + radius));
@@ -254,11 +418,22 @@ final class LookupFilter {
     }
 
     int bindEntityContainer(PreparedStatement statement, int parameterIndex) throws Exception {
+        return bindTrackedEntity(statement, parameterIndex);
+    }
+
+    int bindTrackedEntity(PreparedStatement statement, int parameterIndex) throws Exception {
         statement.setInt(parameterIndex++, checkTime);
         if (userId != null) {
             statement.setInt(parameterIndex++, userId);
         }
+        if (world == null) {
+            return parameterIndex;
+        }
+
         if (location == null) {
+            int worldId = WorldUtils.getWorldId(world.getName());
+            statement.setInt(parameterIndex++, worldId);
+            statement.setInt(parameterIndex++, worldId);
             return parameterIndex;
         }
 
@@ -295,6 +470,43 @@ final class LookupFilter {
             statement.setLong(parameterIndex++, (long) z + 1L);
         }
         return parameterIndex;
+    }
+
+    static String userIds(Connection connection, List<String> users) throws Exception {
+        StringJoiner result = new StringJoiner(",");
+        for (String user : users) {
+            Integer id = MessageAPI.getUserId(connection, user);
+            if (id == null) {
+                // An empty name or #global matches every user.
+                return null;
+            }
+            result.add(String.valueOf(id));
+        }
+        return result.toString();
+    }
+
+    static void appendUserWhere(StringBuilder query, String alias, String includeUserIds, String excludeUserIds) {
+        String column = (alias.isEmpty() ? "" : alias + ".") + ConfigHandler.databaseType.getUserColumn();
+        if (includeUserIds != null && !includeUserIds.isEmpty()) {
+            query.append(" AND ").append(column).append(" IN (").append(includeUserIds).append(")");
+        }
+        if (excludeUserIds == null) {
+            query.append(" AND 1 = 0");
+        }
+        else if (!excludeUserIds.isEmpty()) {
+            query.append(" AND ").append(column).append(" NOT IN (").append(excludeUserIds).append(")");
+        }
+    }
+
+    private String materialIds(List<Material> materials, boolean inventoryBlock) {
+        StringJoiner result = new StringJoiner(",");
+        for (Map.Entry<Integer, Material> entry : materialTypes.entrySet()) {
+            Material material = inventoryBlock ? ItemUtils.itemFilter(entry.getValue(), true) : entry.getValue();
+            if (material != null && materials.contains(material)) {
+                result.add(String.valueOf(entry.getKey()));
+            }
+        }
+        return result.length() == 0 ? "-1" : result.toString();
     }
 
     private static String alias(String alias) {

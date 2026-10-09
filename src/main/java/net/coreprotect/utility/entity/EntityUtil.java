@@ -75,6 +75,7 @@ import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.spigot.SpigotAdapter;
 import net.coreprotect.thread.CacheHandler;
 import net.coreprotect.thread.Scheduler;
+import net.coreprotect.utility.AttributeUtils;
 import net.coreprotect.utility.EntitySpawnTracking;
 import net.coreprotect.utility.ErrorReporter;
 import net.coreprotect.utility.WorldUtils;
@@ -82,6 +83,19 @@ import net.coreprotect.utility.WorldUtils;
 public class EntityUtil {
 
     private static final long ENTITY_RESTORE_TIMEOUT_SECONDS = 30L;
+
+    /**
+     * Position in the entity kill data list of the attribute format marker, followed by the baseline bits. Index 7
+     * holds the entity UUID or null, and index 8 the kill location that EntitySpawnTracking stores for placed entities.
+     */
+    public static final int ATTRIBUTE_FORMAT_INDEX = 9;
+
+    /**
+     * Attribute format marker: the attribute list leaves out the attributes whose bits are set in the long that
+     * follows the marker (see {@link AttributeUtils#baselineBit}). Rows without the marker list every attribute the
+     * entity had.
+     */
+    public static final int BASELINE_ATTRIBUTES = 1;
 
     private EntityUtil() {
         throw new IllegalStateException("Utility class");
@@ -109,7 +123,7 @@ public class EntityUtil {
             return completion;
         }
         if (!legacyTransition) {
-            completion.completeOnTimeout(null, ENTITY_RESTORE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            completion.orTimeout(ENTITY_RESTORE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
 
         Location restoreLocation = EntitySpawnTracking.isPlacedEntityType(type) ? EntitySpawnTracking.getKillRestoreLocation(blockLocation.getWorld(), list) : null;
@@ -194,7 +208,8 @@ public class EntityUtil {
                         }
                         else if (count == 1) {
                             String set = (String) value;
-                            if (set.length() > 0) {
+                            // An owner whose name the server never learned was stored as null
+                            if (set != null && set.length() > 0) {
                                 Player owner = Bukkit.getServer().getPlayer(set);
                                 if (owner == null) {
                                     OfflinePlayer offlinePlayer = Bukkit.getServer().getOfflinePlayer(set);
@@ -214,6 +229,10 @@ public class EntityUtil {
                     Attributable attributable = (Attributable) entity;
                     @SuppressWarnings("unchecked")
                     List<Object> attributes = (List<Object>) list.get(5);
+                    Long baselineBits = baselineBits(list);
+                    if (baselineBits != null) {
+                        AttributeUtils.restoreBaseline(attributable, baselineBits);
+                    }
                     restoreAttributes(attributable, attributes);
                 }
 
@@ -716,23 +735,27 @@ public class EntityUtil {
         return completion;
     }
 
+    static Long baselineBits(List<Object> list) {
+        if (list.size() <= ATTRIBUTE_FORMAT_INDEX + 1) {
+            return null;
+        }
+        Object format = list.get(ATTRIBUTE_FORMAT_INDEX);
+        Object bits = list.get(ATTRIBUTE_FORMAT_INDEX + 1);
+        if (format instanceof Number && ((Number) format).intValue() == BASELINE_ATTRIBUTES && bits instanceof Long) {
+            return (Long) bits;
+        }
+        return null;
+    }
+
     static void restoreAttributes(Attributable attributable, List<Object> attributes) {
         for (Object value : attributes) {
             @SuppressWarnings("unchecked")
             List<Object> attributeData = (List<Object>) value;
-            Attribute attribute = null;
-            if (attributeData.get(0) instanceof Attribute) {
-                attribute = (Attribute) attributeData.get(0);
+            Attribute attribute;
+            try {
+                attribute = AttributeUtils.resolve(attributeData.get(0));
             }
-            else {
-                String key = (String) attributeData.get(0);
-                Object registryValue = registryValue(key, Attribute.class);
-                NamespacedKey namespacedKey = namespacedKey(key);
-                attribute = registryValue instanceof Attribute
-                        ? (Attribute) registryValue
-                        : namespacedKey == null ? null : Registry.ATTRIBUTE.get(namespacedKey);
-            }
-            if (attribute == null) {
+            catch (IllegalArgumentException exception) {
                 continue;
             }
 

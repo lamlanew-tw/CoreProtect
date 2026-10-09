@@ -1,6 +1,5 @@
 package net.coreprotect.database.statement;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -17,7 +16,6 @@ import java.util.StringJoiner;
 
 import org.bukkit.attribute.Attribute;
 import org.bukkit.block.BlockState;
-import org.bukkit.util.io.BukkitObjectInputStream;
 import org.bukkit.util.io.BukkitObjectOutputStream;
 
 import net.coreprotect.bukkit.BukkitAdapter;
@@ -70,7 +68,7 @@ public class EntityStatement {
             return serializeDataStrict(data, kind, databaseType);
         }
         catch (Exception e) {
-            ErrorReporter.report(e, ConfigHandler.EDITION_BRANCH.contains("-dev"));
+            ErrorReporter.report(e);
             return null;
         }
     }
@@ -79,13 +77,8 @@ public class EntityStatement {
         if (data == null) {
             return null;
         }
-        if (EntityDataCodec.isEncoded(data)) {
-            if (targetType.isColumnar()) {
-                return EntityDataCodec.canonicalize(kind, data);
-            }
-            return serializeLegacyData(sanitizeData(EntityDataCodec.decode(kind, data)));
-        }
-        return serializeDataStrict(deserializeDataStrict(data, kind), kind, targetType);
+        byte[] canonical = EntityDataCodec.isEncoded(data) ? EntityDataCodec.canonicalize(kind, data) : EntityDataCodec.fromLegacy(kind, data);
+        return targetType.isColumnar() ? canonical : EntityDataCodec.toLegacy(kind, canonical);
     }
 
     private static byte[] serializeDataStrict(List<Object> data, Kind kind, DatabaseType databaseType) throws Exception {
@@ -149,8 +142,8 @@ public class EntityStatement {
 
             resultSet.close();
         }
-        catch (Exception e) { // only print exception on development branch
-            ErrorReporter.report(e, ConfigHandler.EDITION_BRANCH.contains("-dev"));
+        catch (Exception e) {
+            ErrorReporter.report(e);
         }
 
         return result;
@@ -202,7 +195,7 @@ public class EntityStatement {
             return deserializeDataStrict(data, kind);
         }
         catch (Exception e) {
-            ErrorReporter.report(e, ConfigHandler.EDITION_BRANCH.contains("-dev"));
+            ErrorReporter.report(e);
             return result;
         }
     }
@@ -212,17 +205,6 @@ public class EntityStatement {
     }
 
     private static List<Object> deserializeDataStrict(byte[] data, Kind kind) throws Exception {
-        if (EntityDataCodec.isEncoded(data)) {
-            return EntityDataCodec.decode(kind, data);
-        }
-        try (ByteArrayInputStream bais = new ByteArrayInputStream(data); BukkitObjectInputStream input = new BukkitObjectInputStream(bais)) {
-            Object value = input.readObject();
-            if (!(value instanceof List<?>)) {
-                throw new IllegalArgumentException("Entity data root is not a list");
-            }
-            @SuppressWarnings("unchecked")
-            List<Object> values = (List<Object>) value;
-            return values;
-        }
+        return EntityDataCodec.decode(kind, EntityDataCodec.isEncoded(data) ? data : EntityDataCodec.fromLegacy(kind, data));
     }
 }
